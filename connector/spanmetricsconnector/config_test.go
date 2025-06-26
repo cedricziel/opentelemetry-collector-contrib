@@ -390,11 +390,199 @@ func TestConfigValidate(t *testing.T) {
 			},
 			expectedErr: "failed validating event dimensions: no dimensions configured for events",
 		},
+		{
+			name: "valid transformations",
+			config: Config{
+				ResourceMetricsCacheSize: 1000,
+				MetricsFlushInterval:     60 * time.Second,
+				Transformations: &Transformations{
+					Rules: []AttributeRule{
+						{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http.route"}, Priority: 1},
+						{Condition: "span.kind == SPAN_KIND_CLIENT", Attributes: []string{"http.client.template"}, Priority: 1},
+					},
+					FallbackToSpanName: true,
+				},
+			},
+		},
+		{
+			name: "valid transformations with template",
+			config: Config{
+				ResourceMetricsCacheSize: 1000,
+				MetricsFlushInterval:     60 * time.Second,
+				Transformations: &Transformations{
+					Rules: []AttributeRule{
+						{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 2},
+						{Condition: "span.kind == SPAN_KIND_CLIENT", Attributes: []string{"http.client.template"}, Priority: 1},
+					},
+					FallbackToSpanName: true,
+				},
+			},
+		},
+		{
+			name: "transformations with no rules",
+			config: Config{
+				ResourceMetricsCacheSize: 1000,
+				MetricsFlushInterval:     60 * time.Second,
+				Transformations: &Transformations{
+					Rules: []AttributeRule{},
+				},
+			},
+			expectedErr: "failed validating transformations: transformations requires at least one rule",
+		},
+		{
+			name: "transformations with neither attributes nor template",
+			config: Config{
+				ResourceMetricsCacheSize: 1000,
+				MetricsFlushInterval:     60 * time.Second,
+				Transformations: &Transformations{
+					Rules: []AttributeRule{
+						{Attributes: []string{"http.route"}, Priority: 1},
+					},
+				},
+			},
+			expectedErr: "failed validating transformations: rule at index 0 must have 'condition' set",
+		},
+		{
+			name: "transformations with both attributes and template",
+			config: Config{
+				ResourceMetricsCacheSize: 1000,
+				MetricsFlushInterval:     60 * time.Second,
+				Transformations: &Transformations{
+					Rules: []AttributeRule{
+						{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http.route"}, Template: "{{.http_method}} {{.http_route}}", Priority: 1},
+					},
+				},
+			},
+			expectedErr: "failed validating transformations: rule at index 0 cannot have both 'attributes' and 'template' set",
+		},
+		{
+			name: "transformations with invalid template",
+			config: Config{
+				ResourceMetricsCacheSize: 1000,
+				MetricsFlushInterval:     60 * time.Second,
+				Transformations: &Transformations{
+					Rules: []AttributeRule{
+						{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.invalid syntax", Priority: 1},
+					},
+				},
+			},
+			expectedErr: "failed validating transformations: rule at index 0 has invalid template",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.config.Validate()
+			if tt.expectedErr != "" {
+				assert.ErrorContains(t, err, tt.expectedErr)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateTransformations(t *testing.T) {
+	tests := []struct {
+		name            string
+		transformations *Transformations
+		expectedErr     string
+	}{
+		{
+			name:            "nil transformations",
+			transformations: nil,
+		},
+		{
+			name: "valid transformations",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http.route"}, Priority: 2},
+					{Condition: "span.kind == SPAN_KIND_CLIENT", Attributes: []string{"http.client.template"}, Priority: 1},
+					{Condition: "true", Attributes: []string{"operation.name"}, Priority: 0}, // matches all spans
+				},
+				FallbackToSpanName: true,
+			},
+		},
+		{
+			name: "valid transformations with template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 2},
+					{Condition: "span.kind == SPAN_KIND_CLIENT", Attributes: []string{"http.client.template"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+		},
+		{
+			name: "empty rules",
+			transformations: &Transformations{
+				Rules: []AttributeRule{},
+			},
+			expectedErr: "transformations requires at least one rule",
+		},
+		{
+			name: "missing condition",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Attributes: []string{"http.route"}, Priority: 1},
+				},
+			},
+			expectedErr: "rule at index 0 must have 'condition' set",
+		},
+		{
+			name: "neither attributes nor template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Priority: 1},
+				},
+			},
+			expectedErr: "rule at index 0 must have either 'attributes' or 'template' set",
+		},
+		{
+			name: "both attributes and template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http.route"}, Template: "{{.http_method}} {{.http_route}}", Priority: 1},
+				},
+			},
+			expectedErr: "rule at index 0 cannot have both 'attributes' and 'template' set",
+		},
+		{
+			name: "invalid OTTL condition",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "invalid condition syntax", Attributes: []string{"http.route"}, Priority: 1},
+				},
+			},
+			expectedErr: "rule at index 0 has invalid OTTL condition",
+		},
+		{
+			name: "invalid template syntax",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.invalid syntax", Priority: 1},
+				},
+			},
+			expectedErr: "rule at index 0 has invalid template",
+		},
+		{
+			name: "all valid span kinds",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_UNSPECIFIED", Attributes: []string{"attr1"}, Priority: 1},
+					{Condition: "span.kind == SPAN_KIND_INTERNAL", Attributes: []string{"attr2"}, Priority: 1},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"attr3"}, Priority: 1},
+					{Condition: "span.kind == SPAN_KIND_CLIENT", Attributes: []string{"attr4"}, Priority: 1},
+					{Condition: "span.kind == SPAN_KIND_PRODUCER", Attributes: []string{"attr5"}, Priority: 1},
+					{Condition: "span.kind == SPAN_KIND_CONSUMER", Attributes: []string{"attr6"}, Priority: 1},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTransformations(tt.transformations)
 			if tt.expectedErr != "" {
 				assert.ErrorContains(t, err, tt.expectedErr)
 			} else {

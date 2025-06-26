@@ -6,7 +6,10 @@ package spanmetricsconnector // import "github.com/open-telemetry/opentelemetry-
 import (
 	"bytes"
 	"context"
+	"sort"
+	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/simplelru"
@@ -24,6 +27,9 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/connector/spanmetricsconnector/internal/metrics"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/traceutil"
 	utilattri "github.com/open-telemetry/opentelemetry-collector-contrib/internal/pdatautil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlspan"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/ottlfuncs"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatautil"
 )
 
@@ -84,6 +90,15 @@ type connectorImp struct {
 
 	// Tracks the last TimestampUnixNano for delta metrics so that they represent an uninterrupted series. Unused for cumulative span metrics.
 	lastDeltaTimestamps *simplelru.LRU[metrics.Key, pcommon.Timestamp]
+
+	// Pre-sorted span name rules for efficient evaluation
+	sortedSpanNameRules []AttributeRule
+	
+	// Pre-parsed templates for efficient execution
+	templateCache map[string]*template.Template
+	
+	// Pre-compiled OTTL conditions for efficient evaluation
+	ottlConditionCache map[string]*ottl.Condition[ottlspan.TransformContext]
 }
 
 type resourceMetrics struct {
@@ -138,6 +153,53 @@ func newConnector(logger *zap.Logger, config component.Config, clock clockwork.C
 		}
 	}
 
+	// Pre-sort span name rules by priority (highest first), pre-parse templates, and pre-compile OTTL conditions
+	var sortedRules []AttributeRule
+	templateCache := make(map[string]*template.Template)
+	ottlConditionCache := make(map[string]*ottl.Condition[ottlspan.TransformContext])
+	
+	if cfg.Transformations != nil && len(cfg.Transformations.Rules) > 0 {
+		sortedRules = make([]AttributeRule, len(cfg.Transformations.Rules))
+		copy(sortedRules, cfg.Transformations.Rules)
+		sort.Slice(sortedRules, func(i, j int) bool {
+			return sortedRules[i].Priority > sortedRules[j].Priority
+		})
+		
+		// Create OTTL parser for span context
+		ottlParser, err := ottlspan.NewParser(
+			ottlfuncs.StandardFuncs[ottlspan.TransformContext](),
+			component.TelemetrySettings{Logger: logger},
+		)
+		if err != nil {
+			logger.Warn("Failed to create OTTL parser for span name rules", zap.Error(err))
+		} else {
+			// Pre-compile OTTL conditions and pre-parse templates during initialization
+			for _, rule := range sortedRules {
+				if rule.Template != "" {
+					tmpl, err := template.New("span_name").Option("missingkey=zero").Parse(rule.Template)
+					if err != nil {
+						logger.Warn("Failed to parse span name template, rule will be skipped", 
+							zap.String("template", rule.Template), 
+							zap.Error(err))
+						continue
+					}
+					templateCache[rule.Template] = tmpl
+				}
+				
+				if rule.Condition != "" {
+					condition, err := ottlParser.ParseCondition(rule.Condition)
+					if err != nil {
+						logger.Warn("Failed to parse OTTL condition, rule will be skipped",
+							zap.String("condition", rule.Condition),
+							zap.Error(err))
+						continue
+					}
+					ottlConditionCache[rule.Condition] = condition
+				}
+			}
+		}
+	}
+
 	return &connectorImp{
 		logger:                       logger,
 		config:                       *cfg,
@@ -153,6 +215,9 @@ func newConnector(logger *zap.Logger, config component.Config, clock clockwork.C
 		callsDimensions:              newDimensions(cfg.CallsDimensions),
 		durationDimensions:           newDimensions(cfg.Histogram.Dimensions),
 		events:                       cfg.Events,
+		sortedSpanNameRules:          sortedRules,
+		templateCache:                templateCache,
+		ottlConditionCache:           ottlConditionCache,
 	}, nil
 }
 
@@ -517,6 +582,122 @@ func contains(elements []string, value string) bool {
 	return false
 }
 
+// getSpanName returns the effective span name based on the ruleset configuration
+func (p *connectorImp) getSpanName(span ptrace.Span, resourceAttrs pcommon.Map) string {
+	if len(p.sortedSpanNameRules) == 0 {
+		return span.Name()
+	}
+
+	// Create OTTL transform context for condition evaluation
+	// Create minimal resource and scope objects for OTTL context
+	resource := pcommon.NewResource()
+	resourceAttrs.CopyTo(resource.Attributes())
+	instrumentationScope := pcommon.NewInstrumentationScope()
+	
+	// Create empty resource spans and scope spans for OTTL context
+	resourceSpans := ptrace.NewResourceSpans()
+	resourceAttrs.CopyTo(resourceSpans.Resource().Attributes())
+	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
+	instrumentationScope.CopyTo(scopeSpans.Scope())
+	
+	tCtx := ottlspan.NewTransformContext(span, instrumentationScope, resource, scopeSpans, resourceSpans)
+
+	// Try to find a matching rule (rules are already sorted by priority)
+	for _, rule := range p.sortedSpanNameRules {
+		// Evaluate OTTL condition
+		condition, exists := p.ottlConditionCache[rule.Condition]
+		if !exists {
+			// Skip rule if condition not found in cache
+			continue
+		}
+		
+		matches, err := condition.Eval(context.Background(), tCtx)
+		if err != nil {
+			// Log error but continue to next rule
+			continue
+		}
+		if !matches {
+			continue
+		}
+		
+		// Condition matched - execute the action
+		if rule.Template != "" {
+			spanName := p.executeTemplate(rule.Template, span, resourceAttrs)
+			if spanName != "" {
+				return spanName
+			}
+		} else if len(rule.Attributes) > 0 {
+			// Handle attribute list (try each attribute in order)
+			for _, attrName := range rule.Attributes {
+				// Check span attributes first
+				if attrVal, exists := span.Attributes().Get(attrName); exists && attrVal.Str() != "" {
+					return attrVal.Str()
+				}
+				// Check resource attributes as fallback
+				if attrVal, exists := resourceAttrs.Get(attrName); exists && attrVal.Str() != "" {
+					return attrVal.Str()
+				}
+			}
+		}
+	}
+
+	// If no rules matched and fallback is enabled, use the original span name
+	if p.config.Transformations != nil && p.config.Transformations.FallbackToSpanName {
+		return span.Name()
+	}
+
+	// Otherwise return empty string to indicate no span name
+	return ""
+}
+
+// executeTemplate executes a pre-parsed Go template with span and resource attributes
+func (p *connectorImp) executeTemplate(tmplStr string, span ptrace.Span, resourceAttrs pcommon.Map) string {
+	// Get pre-parsed template from cache
+	tmpl, exists := p.templateCache[tmplStr]
+	if !exists {
+		// Template not found in cache, return empty string
+		return ""
+	}
+
+	// Create template data by combining span and resource attributes
+	templateData := make(map[string]any)
+	
+	// Add resource attributes first (lower precedence)
+	resourceAttrs.Range(func(k string, v pcommon.Value) bool {
+		// Replace dots and other special characters with underscores for template compatibility
+		key := strings.ReplaceAll(k, ".", "_")
+		key = strings.ReplaceAll(key, "-", "_")
+		templateData[key] = v.AsString()
+		return true
+	})
+	
+	// Add span attributes (higher precedence, will override resource attributes)
+	span.Attributes().Range(func(k string, v pcommon.Value) bool {
+		// Replace dots and other special characters with underscores for template compatibility
+		key := strings.ReplaceAll(k, ".", "_")
+		key = strings.ReplaceAll(key, "-", "_")
+		templateData[key] = v.AsString()
+		return true
+	})
+
+	// Execute the pre-parsed template
+	var buf bytes.Buffer
+	err := tmpl.Execute(&buf, templateData)
+	if err != nil {
+		// Template execution failed, return empty string
+		return ""
+	}
+
+	result := strings.TrimSpace(buf.String())
+	
+	// If result contains "<no value>", the template had missing fields, return empty string
+	if strings.Contains(result, "<no value>") {
+		return ""
+	}
+
+	return result
+}
+
 func (p *connectorImp) buildAttributes(
 	serviceName string,
 	span ptrace.Span,
@@ -530,7 +711,10 @@ func (p *connectorImp) buildAttributes(
 		attr.PutStr(serviceNameKey, serviceName)
 	}
 	if !contains(p.config.ExcludeDimensions, spanNameKey) {
-		attr.PutStr(spanNameKey, span.Name())
+		spanName := p.getSpanName(span, resourceAttrs)
+		if spanName != "" {
+			attr.PutStr(spanNameKey, spanName)
+		}
 	}
 	if !contains(p.config.ExcludeDimensions, spanKindKey) {
 		attr.PutStr(spanKindKey, traceutil.SpanKindStr(span.Kind()))
@@ -578,7 +762,10 @@ func (p *connectorImp) buildKey(serviceName string, span ptrace.Span, optionalDi
 		concatDimensionValue(p.keyBuf, serviceName, false)
 	}
 	if !contains(p.config.ExcludeDimensions, spanNameKey) {
-		concatDimensionValue(p.keyBuf, span.Name(), true)
+		spanName := p.getSpanName(span, resourceOrEventAttrs)
+		if spanName != "" {
+			concatDimensionValue(p.keyBuf, spanName, true)
+		}
 	}
 	if !contains(p.config.ExcludeDimensions, spanKindKey) {
 		concatDimensionValue(p.keyBuf, traceutil.SpanKindStr(span.Kind()), true)

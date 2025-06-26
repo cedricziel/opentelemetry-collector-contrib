@@ -98,3 +98,263 @@ spanmetrics/separate_calls_and_duration_dimensions:
       default: GET
   calls_dimensions:
     - name: http.url
+
+# span name ruleset with template for HTTP method + target
+spanmetrics/span_name_ruleset_template:
+  transformations:
+    rules:
+      - condition: 'span.kind == SPAN_KIND_SERVER'
+        template: "{{.http_method}} {{.http_route}}"
+        priority: 3
+      - condition: 'span.kind == SPAN_KIND_CLIENT'
+        template: "{{.http_request_method}} {{.http_client_template}}"
+        priority: 2
+      - condition: 'true'
+        attributes: ["operation.name", "span.name"]
+        priority: 1
+    fallback_to_span_name: true
+
+# span name ruleset with attribute fallback list
+spanmetrics/span_name_ruleset_attributes:
+  transformations:
+    rules:
+      - condition: 'span.kind == SPAN_KIND_SERVER'
+        attributes: ["http.route", "http.target", "http.url"]
+        priority: 2
+      - condition: 'span.kind == SPAN_KIND_CLIENT'
+        attributes: ["http.client.template", "http.url"]
+        priority: 1
+    fallback_to_span_name: false
+
+# comprehensive span name ruleset example with defaults
+spanmetrics/span_name_ruleset_comprehensive:
+  transformations:
+    rules:
+      # High priority: specific HTTP route patterns
+      - condition: 'span.kind == SPAN_KIND_SERVER'
+        template: "{{.http_method}} {{.http_route}}"
+        priority: 10
+      - condition: 'span.kind == SPAN_KIND_SERVER'
+        attributes: ["http.route", "http.target"]
+        priority: 9
+      # Client spans
+      - condition: 'span.kind == SPAN_KIND_CLIENT'
+        template: "{{.http_request_method}} {{.http_client_template}}"
+        priority: 8
+      - condition: 'span.kind == SPAN_KIND_CLIENT'
+        attributes: ["http.client.template", "http.url"]
+        priority: 7
+      # Messaging spans
+      - condition: 'span.kind == SPAN_KIND_PRODUCER'
+        attributes: ["messaging.destination.name"]
+        priority: 6
+      - condition: 'span.kind == SPAN_KIND_CONSUMER'
+        attributes: ["messaging.destination.name"]
+        priority: 5
+      # Default HTTP server span patterns
+      - condition: 'span.kind == SPAN_KIND_SERVER'
+        template: "{{.http_method}} /api{{if .http_target}}{{.http_target}}{{end}}"
+        priority: 4
+      - condition: 'span.kind == SPAN_KIND_SERVER'
+        template: "{{.http_method}} /"
+        priority: 3
+      # Fallback for any span kind
+      - condition: 'true'
+        attributes: ["operation.name"]
+        priority: 1
+    fallback_to_span_name: true
+
+# default rules for HTTP server spans
+spanmetrics/span_name_ruleset_http_defaults:
+  transformations:
+    rules:
+      # Best case: use route if available
+      - condition: 'span.kind == SPAN_KIND_SERVER'
+        template: "{{.http_method}} {{.http_route}}"
+        priority: 10
+      # Specific case: API calls with /api prefix
+      - condition: 'span.kind == SPAN_KIND_SERVER'
+        template: "{{.http_method}} /api"
+        priority: 5
+      # Default fallback for HTTP server spans without route
+      - condition: 'span.kind == SPAN_KIND_SERVER'
+        template: "{{.http_method}} /"
+        priority: 3
+    fallback_to_span_name: true
+
+# advanced OTTL-based ruleset for complex matching
+spanmetrics/span_name_ruleset_ottl_advanced:
+  transformations:
+    rules:
+      # Database operations with complex matching
+      - condition: 'attributes["db.system"] == "postgresql" and attributes["db.operation"] != nil'
+        template: "postgres {{.db_operation}} {{.db_collection_name}}"
+        priority: 100
+      
+      # HTTP API endpoints with status code filtering
+      - condition: 'span.kind == SPAN_KIND_SERVER and attributes["http.method"] != nil and IsMatch(attributes["http.route"], "^/api/.*")'
+        template: "{{.http_method}} {{.http_route}}"
+        priority: 90
+        
+      # Messaging operations with topic/queue detection
+      - condition: 'attributes["messaging.system"] != nil and (attributes["messaging.destination.name"] != nil or attributes["messaging.destination.template"] != nil)'
+        template: "{{.messaging_system}} {{if .messaging_destination_name}}{{.messaging_destination_name}}{{else}}{{.messaging_destination_template}}{{end}}"
+        priority: 80
+        
+      # Error spans get special naming
+      - condition: 'span.status.code == STATUS_CODE_ERROR and attributes["error.type"] != nil'
+        template: "ERROR {{.error_type}}"
+        priority: 70
+        
+      # gRPC services with method extraction
+      - condition: 'attributes["rpc.system"] == "grpc" and attributes["rpc.method"] != nil'
+        template: "{{.rpc_service}}/{{.rpc_method}}"
+        priority: 60
+        
+      # HTTP operations with complex routing
+      - condition: 'attributes["http.method"] != nil and (attributes["http.route"] != nil or attributes["http.target"] != nil)'
+        template: "{{.http_method}} {{if .http_route}}{{.http_route}}{{else}}{{.http_target}}{{end}}"
+        priority: 50
+        
+      # Service-specific operations
+      - condition: 'resource.attributes["service.name"] == "payment-service" and attributes["operation.type"] != nil'
+        template: "payment {{.operation_type}}"
+        priority: 40
+        
+      # Generic fallback for any span with operation attribute
+      - condition: 'attributes["operation.name"] != nil'
+        template: "{{.operation_name}}"
+        priority: 10
+    fallback_to_span_name: true
+
+# HTTP semantic conventions configuration for cardinality reduction
+spanmetrics/http_semantic_conventions:
+  transformations:
+    rules:
+      # HTTP server spans - prefer http.route, fallback to method with normalized path
+      - condition: 'span.kind == SPAN_KIND_SERVER and attributes["http.request.method"] != nil and attributes["http.route"] != nil'
+        template: "{{.http_request_method}} {{.http_route}}"
+        priority: 100
+      
+      # HTTP server spans without route - use method with normalized target
+      - condition: 'span.kind == SPAN_KIND_SERVER and attributes["http.request.method"] != nil and attributes["http.target"] != nil and IsMatch(attributes["http.target"], "^/api/.*")'
+        template: "{{.http_request_method}} /api/*"
+        priority: 90
+        
+      # HTTP server spans without route - default to method with root
+      - condition: 'span.kind == SPAN_KIND_SERVER and attributes["http.request.method"] != nil'
+        template: "{{.http_request_method}} /"
+        priority: 80
+        
+      # HTTP client spans - prefer url.template, fallback to method with normalized URL
+      - condition: 'span.kind == SPAN_KIND_CLIENT and attributes["http.request.method"] != nil and attributes["url.template"] != nil'
+        template: "{{.http_request_method}} {{.url_template}}"
+        priority: 70
+        
+      # HTTP client spans without template - use method with normalized URL
+      - condition: 'span.kind == SPAN_KIND_CLIENT and attributes["http.request.method"] != nil and attributes["url.full"] != nil'
+        template: "{{.http_request_method}} HTTP"
+        priority: 60
+        
+      # Legacy HTTP attributes support (http.method)
+      - condition: 'span.kind == SPAN_KIND_SERVER and attributes["http.method"] != nil and attributes["http.route"] != nil'
+        template: "{{.http_method}} {{.http_route}}"
+        priority: 50
+        
+      - condition: 'span.kind == SPAN_KIND_SERVER and attributes["http.method"] != nil and attributes["http.target"] != nil and IsMatch(attributes["http.target"], "^/api/.*")'
+        template: "{{.http_method}} /api/*"
+        priority: 40
+        
+      - condition: 'span.kind == SPAN_KIND_SERVER and attributes["http.method"] != nil'
+        template: "{{.http_method}} /"
+        priority: 30
+        
+      # Database operations - normalize to avoid high cardinality
+      - condition: 'attributes["db.system"] != nil and attributes["db.operation"] != nil'
+        template: "{{.db_system}} {{.db_operation}}"
+        priority: 20
+        
+      # Messaging operations following OpenTelemetry semantic conventions
+      # Priority: messaging.destination.template > messaging.destination.name > server.address:port
+      - condition: 'attributes["messaging.system"] != nil and attributes["messaging.operation.name"] != nil and attributes["messaging.destination.template"] != nil'
+        template: "{{.messaging_operation_name}} {{.messaging_destination_template}}"
+        priority: 25
+        
+      - condition: 'attributes["messaging.system"] != nil and attributes["messaging.operation.name"] != nil and attributes["messaging.destination.name"] != nil'
+        template: "{{.messaging_operation_name}} {{.messaging_destination_name}}"
+        priority: 20
+        
+      - condition: 'attributes["messaging.system"] != nil and attributes["messaging.operation.name"] != nil and attributes["server.address"] != nil'
+        template: "{{.messaging_operation_name}} {{.server_address}}"
+        priority: 18
+        
+      # Legacy messaging operations - fallback to operation type
+      - condition: 'attributes["messaging.system"] != nil and attributes["messaging.operation"] != nil'
+        template: "{{.messaging_system}} {{.messaging_operation}}"
+        priority: 15
+        
+      # RPC operations following OpenTelemetry semantic conventions
+      # Format: $package.$service/$method
+      - condition: 'attributes["rpc.system"] != nil and attributes["rpc.service"] != nil and attributes["rpc.method"] != nil'
+        template: "{{.rpc_service}}/{{.rpc_method}}"
+        priority: 12
+        
+      # Generic fallback
+      - condition: 'true'
+        attributes: ["operation.name"]
+        priority: 1
+    fallback_to_span_name: true
+
+# Messaging and RPC semantic conventions configuration
+spanmetrics/messaging_rpc_semantic_conventions:
+  transformations:
+    rules:
+      # Messaging spans following OpenTelemetry semantic conventions
+      # Format: "{messaging.operation.name} {destination}"
+      
+      # Priority 1: Use messaging.destination.template (preferred)
+      - condition: 'attributes["messaging.operation.name"] != nil and attributes["messaging.destination.template"] != nil'
+        template: "{{.messaging_operation_name}} {{.messaging_destination_template}}"
+        priority: 100
+        
+      # Priority 2: Use messaging.destination.name (if not temporary/anonymous)
+      - condition: 'attributes["messaging.operation.name"] != nil and attributes["messaging.destination.name"] != nil'
+        template: "{{.messaging_operation_name}} {{.messaging_destination_name}}"
+        priority: 90
+        
+      # Priority 3: Fallback to server.address:server.port
+      - condition: 'attributes["messaging.operation.name"] != nil and attributes["server.address"] != nil and attributes["server.port"] != nil'
+        template: "{{.messaging_operation_name}} {{.server_address}}:{{.server_port}}"
+        priority: 80
+        
+      - condition: 'attributes["messaging.operation.name"] != nil and attributes["server.address"] != nil'
+        template: "{{.messaging_operation_name}} {{.server_address}}"
+        priority: 75
+        
+      # RPC spans following OpenTelemetry semantic conventions  
+      # Format: "$package.$service/$method"
+      
+      # gRPC specific patterns
+      - condition: 'attributes["rpc.system"] == "grpc" and attributes["rpc.service"] != nil and attributes["rpc.method"] != nil'
+        template: "{{.rpc_service}}/{{.rpc_method}}"
+        priority: 70
+        
+      # Generic RPC patterns
+      - condition: 'attributes["rpc.system"] != nil and attributes["rpc.service"] != nil and attributes["rpc.method"] != nil'
+        template: "{{.rpc_service}}/{{.rpc_method}}"
+        priority: 60
+        
+      # Legacy messaging fallbacks
+      - condition: 'attributes["messaging.system"] != nil and attributes["messaging.operation"] != nil and attributes["messaging.destination.name"] != nil'
+        template: "{{.messaging_operation}} {{.messaging_destination_name}}"
+        priority: 50
+        
+      - condition: 'attributes["messaging.system"] != nil and attributes["messaging.operation"] != nil'
+        template: "{{.messaging_system}} {{.messaging_operation}}"
+        priority: 40
+        
+      # Generic operation fallback
+      - condition: 'true'
+        attributes: ["operation.name"]
+        priority: 1
+    fallback_to_span_name: true

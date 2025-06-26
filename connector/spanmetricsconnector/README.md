@@ -127,6 +127,13 @@ The following settings can be optionally configured:
   - `dimensions`: (mandatory if `enabled`) the list of the span's event attributes to add as dimensions to the `traces.span.metrics.events` metric, which will be included _on top of_ the common and configured `dimensions` for span attributes and resource attributes.
 - `resource_metrics_key_attributes`: Filter the resource attributes used to produce the resource metrics key map hash. Use this in case changing resource attributes (e.g. process id) are breaking counter metrics.
 - `aggregation_cardinality_limit` (default: `0`): Defines the maximum number of unique combinations of dimensions that will be tracked for metrics aggregation. When the limit is reached, additional unique combinations will be dropped but registered under a new entry with `otel.metric.overflow="true"`. A value of `0` means no limit is applied.
+- `transformations`: Configure rules for generating span names in metrics using OpenTelemetry Transformation Language (OTTL). This allows using more meaningful names following semantic conventions instead of the default span name.
+  - `rules`: List of rules to apply for span name generation, evaluated by priority (highest first).
+    - `condition`: OTTL expression that must evaluate to true for this rule to apply (e.g., `span.kind == SPAN_KIND_SERVER`).
+    - `attributes`: List of attribute names to try in order (e.g., `["http.route", "http.target"]`). Cannot be used with `template`.
+    - `template`: Go template for generating span names from attributes (e.g., `"{{.http_method}} {{.http_route}}"`). Cannot be used with `attributes`.
+    - `priority`: Higher values have higher priority when multiple rules match.
+  - `fallback_to_span_name` (default: `true`): Whether to use the original span name if no rules match or attributes are found.
 
 The feature gate `connector.spanmetrics.legacyMetricNames` (disabled by default) controls the connector to use legacy metric names.
 
@@ -178,6 +185,18 @@ connectors:
       - telemetry.sdk.name
     include_instrumentation_scope:
       - express
+    transformations:
+      rules:
+        - condition: 'span.kind == SPAN_KIND_SERVER'
+          template: "{{.http_method}} {{.http_route}}"  # creates "GET /api/users" format
+          priority: 3
+        - condition: 'span.kind == SPAN_KIND_CLIENT'
+          attributes: ["http.client.template", "http.url"]
+          priority: 2
+        - condition: 'true'  # matches any span
+          attributes: ["operation.name"]
+          priority: 1
+      fallback_to_span_name: true
 
 service:
   pipelines:
@@ -237,6 +256,129 @@ For example:
 target_info{job="shippingservice", instance="...", ...} 1
 calls_total{span_name="/Address", service_name="shippingservice", span_kind="SPAN_KIND_SERVER", status_code="STATUS_CODE_UNSET", ...} 142
 ```
+
+### Span Name Transformations
+
+The `transformations` feature allows you to customize span names in metrics using OpenTelemetry Transformation Language (OTTL) conditions and Go templates. This enables following semantic conventions and creating meaningful, low-cardinality span names for better observability.
+
+#### Example Configuration
+
+```yaml
+connectors:
+  spanmetrics:
+    transformations:
+      rules:
+        # HTTP server spans following semantic conventions
+        - condition: 'span.kind == SPAN_KIND_SERVER and attributes["http.route"] != nil'
+          template: "{{.http_method}} {{.http_route}}"
+          priority: 100
+          
+        # HTTP client spans  
+        - condition: 'span.kind == SPAN_KIND_CLIENT'
+          attributes: ["http.client.template", "url.template"]
+          priority: 90
+          
+        # Messaging operations following semantic conventions
+        - condition: 'attributes["messaging.operation.name"] != nil'
+          template: "{{.messaging_operation_name}} {{.messaging_destination_name}}"
+          priority: 80
+          
+        # RPC operations following semantic conventions
+        - condition: 'attributes["rpc.system"] != nil'
+          template: "{{.rpc_service}}/{{.rpc_method}}"
+          priority: 70
+          
+        # Database operations
+        - condition: 'attributes["db.system"] != nil'
+          template: "{{.db_system}} {{.db_operation}}"
+          priority: 60
+          
+        # Generic fallback
+        - condition: 'true'
+          attributes: ["operation.name"]
+          priority: 1
+      fallback_to_span_name: true
+```
+
+#### How it works
+
+1. **Rules are evaluated by priority** (highest first)
+2. **OTTL condition evaluation**: Each rule's condition is evaluated against the span using OTTL
+3. **Action execution**: When a condition matches:
+   - **Template**: Executes Go template with span and resource attributes
+   - **Attributes**: Tries attributes in order from span, then resource attributes
+4. **First match wins**: The first rule that produces a non-empty result is used
+5. **Fallback behavior**: If no rules match and `fallback_to_span_name` is true, uses original span name
+
+#### OTTL Conditions
+
+OTTL (OpenTelemetry Transformation Language) provides powerful expression capabilities:
+
+```yaml
+# Span kind matching
+condition: 'span.kind == SPAN_KIND_SERVER'
+
+# Attribute existence and value checks
+condition: 'attributes["http.method"] != nil and attributes["http.route"] != nil'
+
+# Complex logical expressions
+condition: 'span.kind == SPAN_KIND_SERVER and (attributes["http.route"] != nil or attributes["http.target"] != nil)'
+
+# Resource attribute access
+condition: 'resource.attributes["service.name"] == "payment-service"'
+
+# Status code checks
+condition: 'span.status.code == STATUS_CODE_ERROR'
+
+# Pattern matching
+condition: 'IsMatch(attributes["http.target"], "^/api/.*")'
+```
+
+#### Go Templates
+
+Templates provide flexible span name generation:
+
+```yaml
+# HTTP method + route
+template: "{{.http_method}} {{.http_route}}"
+# Result: "GET /api/users/{id}"
+
+# Messaging operation + destination  
+template: "{{.messaging_operation_name}} {{.messaging_destination_name}}"
+# Result: "publish user.events"
+
+# RPC service/method
+template: "{{.rpc_service}}/{{.rpc_method}}"
+# Result: "user.UserService/GetUser"
+
+# Complex conditional logic
+template: "{{.http_method}} {{if .http_route}}{{.http_route}}{{else}}/{{end}}"
+# Result: "POST /api/orders" or "POST /"
+```
+
+#### Semantic Convention Support
+
+The connector includes built-in support for OpenTelemetry semantic conventions:
+
+**HTTP Spans**: Follow `{method} {target}` pattern
+
+- Server spans prefer `http.route`, fallback to `http.target`  
+- Client spans prefer `url.template`, fallback to method patterns
+- Supports both new (`http.request.method`) and legacy (`http.method`) attributes
+
+**Messaging Spans**: Follow `{operation} {destination}` pattern
+
+- Priority: `messaging.destination.template` > `messaging.destination.name` > `server.address`
+- Examples: `"publish shop.orders"`, `"consume user-events"`
+
+**RPC Spans**: Follow `{service}/{method}` pattern
+
+- Format: `"$package.$service/$method"`
+- Examples: `"grpc.UserService/GetUser"`, `"payment.PaymentService/ProcessPayment"`
+
+**Database Operations**: Follow `{system} {operation}` pattern
+
+- Examples: `"postgresql SELECT"`, `"redis GET"`
 
 ### More Examples
 

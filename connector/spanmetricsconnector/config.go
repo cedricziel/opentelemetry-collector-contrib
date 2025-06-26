@@ -6,12 +6,17 @@ package spanmetricsconnector // import "github.com/open-telemetry/opentelemetry-
 import (
 	"errors"
 	"fmt"
+	"text/template"
 	"time"
 
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap/xconfmap"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/connector/spanmetricsconnector/internal/metrics"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlspan"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/ottlfuncs"
 )
 
 const (
@@ -29,6 +34,33 @@ var defaultDeltaTimestampCacheSize = 1000
 type Dimension struct {
 	Name    string  `mapstructure:"name"`
 	Default *string `mapstructure:"default"`
+	// prevent unkeyed literal initialization
+	_ struct{}
+}
+
+// AttributeRule defines a rule for selecting span name based on span characteristics
+type AttributeRule struct {
+	// Condition allows complex matching using OTTL expressions for rule evaluation
+	// Example: 'span.kind == SPAN_KIND_SERVER and attributes["http.route"] != nil'
+	// Example: 'attributes["db.system"] == "postgresql" and IsMatch(name, ".*query.*")'
+	Condition string `mapstructure:"condition"`
+	// Attributes specifies a list of attribute names to try in order (first non-empty wins)
+	Attributes []string `mapstructure:"attributes"`
+	// Template allows combining multiple attributes using Go template syntax
+	// Example: "{{.http_method}} {{.http_route}}" or "{{.http_method}} {{.http_target}}"
+	Template string `mapstructure:"template"`
+	// Priority defines the order of precedence (higher values have higher priority)
+	Priority int `mapstructure:"priority"`
+	// prevent unkeyed literal initialization
+	_ struct{}
+}
+
+// Transformations defines rules for selecting span name attribute based on span characteristics
+type Transformations struct {
+	// Rules defines the list of rules for selecting span name attribute
+	Rules []AttributeRule `mapstructure:"rules"`
+	// Fallback to span.Name() if no rules match or attributes are found
+	FallbackToSpanName bool `mapstructure:"fallback_to_span_name"`
 	// prevent unkeyed literal initialization
 	_ struct{}
 }
@@ -92,6 +124,9 @@ type Config struct {
 	IncludeInstrumentationScope []string `mapstructure:"include_instrumentation_scope"`
 
 	AggregationCardinalityLimit int `mapstructure:"aggregation_cardinality_limit"`
+
+	// Transformations defines rules for selecting span name attribute based on span characteristics
+	Transformations *Transformations `mapstructure:"transformations"`
 }
 
 type HistogramConfig struct {
@@ -167,6 +202,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("invalid aggregation_cardinality_limit: %v, the limit should be positive", c.AggregationCardinalityLimit)
 	}
 
+	if err := validateTransformations(c.Transformations); err != nil {
+		return fmt.Errorf("failed validating transformations: %w", err)
+	}
+
 	return nil
 }
 
@@ -212,4 +251,79 @@ func validateEventDimensions(enabled bool, dimensions []Dimension) error {
 		return errors.New("no dimensions configured for events")
 	}
 	return validateDimensions(dimensions)
+}
+
+// validateTransformations validates the transformations configuration
+func validateTransformations(transformations *Transformations) error {
+	if transformations == nil {
+		return nil
+	}
+
+	if len(transformations.Rules) == 0 {
+		return errors.New("transformations requires at least one rule")
+	}
+
+
+	for i, rule := range transformations.Rules {
+		// Rule must have a condition
+		if rule.Condition == "" {
+			return fmt.Errorf("rule at index %d must have 'condition' set", i)
+		}
+
+		// Rule must have exactly one action method
+		actionMethods := 0
+		if len(rule.Attributes) > 0 {
+			actionMethods++
+		}
+		if rule.Template != "" {
+			actionMethods++
+		}
+
+		if actionMethods == 0 {
+			return fmt.Errorf("rule at index %d must have either 'attributes' or 'template' set", i)
+		}
+		if actionMethods > 1 {
+			return fmt.Errorf("rule at index %d cannot have both 'attributes' and 'template' set", i)
+		}
+
+		// Validate template syntax if provided
+		if rule.Template != "" {
+			if err := validateTemplateFormat(rule.Template); err != nil {
+				return fmt.Errorf("rule at index %d has invalid template: %w", i, err)
+			}
+		}
+
+		// Validate OTTL condition syntax if provided
+		if rule.Condition != "" {
+			if err := validateOTTLCondition(rule.Condition); err != nil {
+				return fmt.Errorf("rule at index %d has invalid OTTL condition: %w", i, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateTemplateFormat validates that the template string is valid Go template syntax
+func validateTemplateFormat(tmpl string) error {
+	_, err := template.New("span_name").Parse(tmpl)
+	return err
+}
+
+// validateOTTLCondition validates that the OTTL condition string is valid
+func validateOTTLCondition(condition string) error {
+	ottlParser, err := ottlspan.NewParser(
+		ottlfuncs.StandardFuncs[ottlspan.TransformContext](),
+		component.TelemetrySettings{Logger: zap.NewNop()},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create OTTL parser: %w", err)
+	}
+	
+	_, err = ottlParser.ParseCondition(condition)
+	if err != nil {
+		return fmt.Errorf("invalid OTTL condition syntax: %w", err)
+	}
+	
+	return nil
 }

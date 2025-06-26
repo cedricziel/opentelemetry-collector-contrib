@@ -7,14 +7,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/jonboulle/clockwork"
 	"github.com/lightstep/go-expohisto/structure"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/connector/connectortest"
 	"go.opentelemetry.io/collector/consumer"
@@ -32,6 +35,9 @@ import (
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/connector/spanmetricsconnector/internal/metrics"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/pdatautil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlspan"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/ottlfuncs"
 )
 
 const (
@@ -2256,4 +2262,396 @@ func TestConnectorWithCardinalityLimitForEvents(t *testing.T) {
 
 	assert.Equal(t, 2, normalCount, "expected 2 normal metrics")
 	assert.Equal(t, 1, overflowCount, "expected 1 overflow metric")
+}
+
+func TestGetSpanName(t *testing.T) {
+	mockClock := clockwork.NewFakeClock()
+
+	// Helper function to create a span with attributes
+	createSpan := func(name string, kind ptrace.SpanKind, attrs map[string]string) ptrace.Span {
+		span := ptrace.NewSpan()
+		span.SetName(name)
+		span.SetKind(kind)
+		for k, v := range attrs {
+			span.Attributes().PutStr(k, v)
+		}
+		return span
+	}
+
+	// Helper function to create resource attributes
+	createResourceAttrs := func(attrs map[string]string) pcommon.Map {
+		resourceAttrs := pcommon.NewMap()
+		for k, v := range attrs {
+			resourceAttrs.PutStr(k, v)
+		}
+		return resourceAttrs
+	}
+
+	tests := []struct {
+		name           string
+		transformations *Transformations
+		span           ptrace.Span
+		resourceAttrs  pcommon.Map
+		expectedResult string
+	}{
+		{
+			name:            "no transformations - use span name",
+			transformations: nil,
+			span:           createSpan("GET /api/users", ptrace.SpanKindServer, nil),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "GET /api/users",
+		},
+		{
+			name: "empty transformations - use span name",
+			transformations: &Transformations{
+				Rules: []AttributeRule{},
+			},
+			span:           createSpan("GET /api/users", ptrace.SpanKindServer, nil),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "GET /api/users",
+		},
+		{
+			name: "server span with http.route - use route",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http.route"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("GET /api/users", ptrace.SpanKindServer, map[string]string{
+				"http.route": "/api/users",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "/api/users",
+		},
+		{
+			name: "client span with http.client.template - use template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_CLIENT", Attributes: []string{"http.client.template"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP GET", ptrace.SpanKindClient, map[string]string{
+				"http.client.template": "GET /users/{id}",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "GET /users/{id}",
+		},
+		{
+			name: "priority ordering - higher priority wins",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http.route"}, Priority: 2},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"operation.name"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("GET /api/users", ptrace.SpanKindServer, map[string]string{
+				"http.route":     "/api/users",
+				"operation.name": "get_users",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "/api/users", // http.route wins due to higher priority
+		},
+		{
+			name: "no span kind specified - matches any span",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "true", Attributes: []string{"operation.name"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("some_operation", ptrace.SpanKindInternal, map[string]string{
+				"operation.name": "internal_operation",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "internal_operation",
+		},
+		{
+			name: "attribute in resource attrs - fallback to resource",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"custom.operation"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("GET /api/users", ptrace.SpanKindServer, nil),
+			resourceAttrs: createResourceAttrs(map[string]string{
+				"custom.operation": "user_api",
+			}),
+			expectedResult: "user_api",
+		},
+		{
+			name: "span kind doesn't match - use fallback",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_CLIENT", Attributes: []string{"http.route"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("GET /api/users", ptrace.SpanKindServer, map[string]string{
+				"http.route": "/api/users",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "GET /api/users", // fallback to span name
+		},
+		{
+			name: "attribute not found - use fallback",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http.route"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span:           createSpan("GET /api/users", ptrace.SpanKindServer, nil),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "GET /api/users", // fallback to span name
+		},
+		{
+			name: "attribute not found and no fallback - empty string",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http.route"}, Priority: 1},
+				},
+				FallbackToSpanName: false,
+			},
+			span:           createSpan("GET /api/users", ptrace.SpanKindServer, nil),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "", // no fallback
+		},
+		{
+			name: "empty attribute value - try other rules",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http.route"}, Priority: 2},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"operation.name"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("GET /api/users", ptrace.SpanKindServer, map[string]string{
+				"http.route":     "", // empty value
+				"operation.name": "get_users",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "get_users", // fall through to next rule
+		},
+		{
+			name: "http method + target - both present with template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, map[string]string{
+				"http_method": "GET",
+				"http_route":  "/api/users/{id}",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "GET /api/users/{id}",
+		},
+		{
+			name: "http method + target - prefer route over target with template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 2},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_target}}", Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, map[string]string{
+				"http_method": "POST",
+				"http_route":  "/api/users",
+				"http_target": "/api/users?filter=active", // should prefer route
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "POST /api/users",
+		},
+		{
+			name: "http method + target - use target when route absent with template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 2},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_target}}", Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, map[string]string{
+				"http_method": "PUT",
+				"http_target": "/api/users/123",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "PUT /api/users/123",
+		},
+		{
+			name: "http method - only method present with attribute fallback",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http_method"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, map[string]string{
+				"http_method": "DELETE",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "DELETE",
+		},
+		{
+			name: "http route - only target present with attribute fallback",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Attributes: []string{"http_route"}, Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, map[string]string{
+				"http_route": "/health",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "/health",
+		},
+		{
+			name: "http method + target - new semconv attributes with template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_request_method}} {{.http_route}}", Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, map[string]string{
+				"http_request_method": "PATCH", // new semantic convention
+				"http_route":          "/api/users/{id}",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "PATCH /api/users/{id}",
+		},
+		{
+			name: "http method + target - from resource attributes with template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, nil),
+			resourceAttrs: createResourceAttrs(map[string]string{
+				"http_method": "GET",
+				"http_route":  "/status",
+			}),
+			expectedResult: "GET /status",
+		},
+		{
+			name: "http method + target - no http attributes, fallback with template",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 1},
+				},
+				FallbackToSpanName: true,
+			},
+			span:           createSpan("Non-HTTP Operation", ptrace.SpanKindServer, nil),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "Non-HTTP Operation", // fallback to span name
+		},
+		{
+			name: "default HTTP server rule - method only defaults to method /",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 10},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} /", Priority: 3},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, map[string]string{
+				"http_method": "GET",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "GET /", // falls back to default pattern
+		},
+		{
+			name: "default API rule - API target defaults to method /api",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 10},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} /api", Priority: 5},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} /", Priority: 3},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, map[string]string{
+				"http_method": "POST",
+				"http_target": "/api/users",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "POST /api", // uses API default pattern
+		},
+		{
+			name: "comprehensive default rules - route takes precedence",
+			transformations: &Transformations{
+				Rules: []AttributeRule{
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} {{.http_route}}", Priority: 10},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} /api", Priority: 5},
+					{Condition: "span.kind == SPAN_KIND_SERVER", Template: "{{.http_method}} /", Priority: 3},
+				},
+				FallbackToSpanName: true,
+			},
+			span: createSpan("HTTP Request", ptrace.SpanKindServer, map[string]string{
+				"http_method": "GET",
+				"http_route":  "/api/users/{id}",
+				"http_target": "/api/users/123",
+			}),
+			resourceAttrs:  createResourceAttrs(nil),
+			expectedResult: "GET /api/users/{id}", // route takes highest priority
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a new connector with the specific ruleset for this test
+			testConnector := &connectorImp{
+				config: Config{Transformations: tt.transformations},
+				clock:  mockClock,
+			}
+			
+			// Initialize sorted rules, template cache, and OTTL conditions for testing (normally done in newConnector)
+			if tt.transformations != nil && len(tt.transformations.Rules) > 0 {
+				testConnector.sortedSpanNameRules = make([]AttributeRule, len(tt.transformations.Rules))
+				copy(testConnector.sortedSpanNameRules, tt.transformations.Rules)
+				sort.Slice(testConnector.sortedSpanNameRules, func(i, j int) bool {
+					return testConnector.sortedSpanNameRules[i].Priority > testConnector.sortedSpanNameRules[j].Priority
+				})
+				
+				// Pre-parse templates and OTTL conditions for testing
+				testConnector.templateCache = make(map[string]*template.Template)
+				testConnector.ottlConditionCache = make(map[string]*ottl.Condition[ottlspan.TransformContext])
+				
+				// Create OTTL parser for span context (needed for condition compilation)
+				ottlParser, err := ottlspan.NewParser(
+					ottlfuncs.StandardFuncs[ottlspan.TransformContext](),
+					component.TelemetrySettings{Logger: zap.NewNop()},
+				)
+				require.NoError(t, err)
+				
+				for _, rule := range testConnector.sortedSpanNameRules {
+					if rule.Template != "" {
+						tmpl, err := template.New("span_name").Option("missingkey=zero").Parse(rule.Template)
+						if err == nil {
+							testConnector.templateCache[rule.Template] = tmpl
+						}
+					}
+					
+					if rule.Condition != "" {
+						condition, err := ottlParser.ParseCondition(rule.Condition)
+						if err == nil {
+							testConnector.ottlConditionCache[rule.Condition] = condition
+						}
+					}
+				}
+			}
+			
+			result := testConnector.getSpanName(tt.span, tt.resourceAttrs)
+			assert.Equal(t, tt.expectedResult, result)
+		})
+	}
 }
