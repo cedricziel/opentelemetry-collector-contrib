@@ -99,6 +99,11 @@ type connectorImp struct {
 	
 	// Pre-compiled OTTL conditions for efficient evaluation
 	ottlConditionCache map[string]*ottl.Condition[ottlspan.TransformContext]
+	
+	// Object pools for reusing expensive OTTL context objects
+	resourcePool sync.Pool
+	resourceSpansPool sync.Pool
+	scopeSpansPool sync.Pool
 }
 
 type resourceMetrics struct {
@@ -200,7 +205,7 @@ func newConnector(logger *zap.Logger, config component.Config, clock clockwork.C
 		}
 	}
 
-	return &connectorImp{
+	connector := &connectorImp{
 		logger:                       logger,
 		config:                       *cfg,
 		resourceMetrics:              resourceMetricsCache,
@@ -218,7 +223,21 @@ func newConnector(logger *zap.Logger, config component.Config, clock clockwork.C
 		sortedSpanNameRules:          sortedRules,
 		templateCache:                templateCache,
 		ottlConditionCache:           ottlConditionCache,
-	}, nil
+	}
+	
+	// Initialize object pools for OTTL context reuse
+	connector.resourcePool.New = func() interface{} {
+		return pcommon.NewResource()
+	}
+	connector.resourceSpansPool.New = func() interface{} {
+		return ptrace.NewResourceSpans()
+	}
+	connector.scopeSpansPool.New = func() interface{} {
+		rs := ptrace.NewResourceSpans()
+		return rs.ScopeSpans().AppendEmpty()
+	}
+	
+	return connector, nil
 }
 
 func initHistogramMetrics(cfg Config) metrics.HistogramMetrics {
@@ -582,25 +601,94 @@ func contains(elements []string, value string) bool {
 	return false
 }
 
+// isSimpleSpanKindCondition checks if a condition is a simple span kind match that can be optimized
+func isSimpleSpanKindCondition(condition string, spanKind ptrace.SpanKind) bool {
+	switch condition {
+	case "span.kind == SPAN_KIND_UNSPECIFIED":
+		return spanKind == ptrace.SpanKindUnspecified
+	case "span.kind == SPAN_KIND_INTERNAL":
+		return spanKind == ptrace.SpanKindInternal
+	case "span.kind == SPAN_KIND_SERVER":
+		return spanKind == ptrace.SpanKindServer
+	case "span.kind == SPAN_KIND_CLIENT":
+		return spanKind == ptrace.SpanKindClient
+	case "span.kind == SPAN_KIND_PRODUCER":
+		return spanKind == ptrace.SpanKindProducer
+	case "span.kind == SPAN_KIND_CONSUMER":
+		return spanKind == ptrace.SpanKindConsumer
+	default:
+		return false
+	}
+}
+
 // getSpanName returns the effective span name based on the ruleset configuration
 func (p *connectorImp) getSpanName(span ptrace.Span, resourceAttrs pcommon.Map) string {
 	if len(p.sortedSpanNameRules) == 0 {
 		return span.Name()
 	}
+	
+	// Fast path: Check if we can avoid OTTL context creation for simple rules
+	spanKind := span.Kind()
+	for _, rule := range p.sortedSpanNameRules {
+		// Fast path for simple span kind + attribute rules
+		if isSimpleSpanKindCondition(rule.Condition, spanKind) && len(rule.Attributes) > 0 && rule.Template == "" {
+			for _, attrName := range rule.Attributes {
+				if attrVal, exists := span.Attributes().Get(attrName); exists && attrVal.Str() != "" {
+					return attrVal.Str()
+				}
+				if attrVal, exists := resourceAttrs.Get(attrName); exists && attrVal.Str() != "" {
+					return attrVal.Str()
+				}
+			}
+		}
+		// Fast path for universal rules (condition == "true")
+		if rule.Condition == "true" && len(rule.Attributes) > 0 && rule.Template == "" {
+			for _, attrName := range rule.Attributes {
+				if attrVal, exists := span.Attributes().Get(attrName); exists && attrVal.Str() != "" {
+					return attrVal.Str()
+				}
+				if attrVal, exists := resourceAttrs.Get(attrName); exists && attrVal.Str() != "" {
+					return attrVal.Str()
+				}
+			}
+		}
+	}
 
-	// Create OTTL transform context for condition evaluation
-	// Create minimal resource and scope objects for OTTL context
-	resource := pcommon.NewResource()
+	// Reuse objects from pools for OTTL context creation (with nil check)
+	resourceObj := p.resourcePool.Get()
+	if resourceObj == nil {
+		resourceObj = pcommon.NewResource()
+	}
+	resource := resourceObj.(pcommon.Resource)
+	
+	resourceSpansObj := p.resourceSpansPool.Get()
+	if resourceSpansObj == nil {
+		resourceSpansObj = ptrace.NewResourceSpans()
+	}
+	resourceSpans := resourceSpansObj.(ptrace.ResourceSpans)
+	
+	// Reset and populate the pooled objects
+	resource.Attributes().Clear()
 	resourceAttrs.CopyTo(resource.Attributes())
-	instrumentationScope := pcommon.NewInstrumentationScope()
 	
-	// Create empty resource spans and scope spans for OTTL context
-	resourceSpans := ptrace.NewResourceSpans()
+	resourceSpans.Resource().Attributes().Clear()
 	resourceAttrs.CopyTo(resourceSpans.Resource().Attributes())
-	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
-	instrumentationScope.CopyTo(scopeSpans.Scope())
 	
-	tCtx := ottlspan.NewTransformContext(span, instrumentationScope, resource, scopeSpans, resourceSpans)
+	// Create scope with minimal overhead
+	instrumentationScope := pcommon.NewInstrumentationScope()
+	scopeSpans := resourceSpans.ScopeSpans()
+	if scopeSpans.Len() == 0 {
+		scopeSpans.AppendEmpty()
+	}
+	instrumentationScope.CopyTo(scopeSpans.At(0).Scope())
+	
+	tCtx := ottlspan.NewTransformContext(span, instrumentationScope, resource, scopeSpans.At(0), resourceSpans)
+	
+	// Defer returning objects to pools
+	defer func() {
+		p.resourcePool.Put(resource)
+		p.resourceSpansPool.Put(resourceSpans)
+	}()
 
 	// Try to find a matching rule (rules are already sorted by priority)
 	for _, rule := range p.sortedSpanNameRules {

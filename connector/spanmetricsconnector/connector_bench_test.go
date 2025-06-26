@@ -316,3 +316,84 @@ func createResourceAttrs(attrs map[string]string) pcommon.Map {
 	}
 	return resourceAttrs
 }
+
+// BenchmarkGetSpanNameOptimized benchmarks the optimized span name logic with fast paths
+func BenchmarkGetSpanNameOptimized(b *testing.B) {
+	cfg := createDefaultConfig()
+	config := cfg.(*Config)
+	config.Transformations = &Transformations{
+		Rules: []AttributeRule{
+			// Simple span kind rule - should hit fast path
+			{
+				Condition:  "span.kind == SPAN_KIND_SERVER",
+				Attributes: []string{"http.route", "http.target"},
+				Priority:   100,
+			},
+			// Universal rule - should hit fast path
+			{
+				Condition:  "true",
+				Attributes: []string{"operation.name"},
+				Priority:   1,
+			},
+		},
+		FallbackToSpanName: true,
+	}
+
+	conn, err := newConnector(zap.NewNop(), config, clockwork.NewFakeClock())
+	if err != nil {
+		b.Fatalf("Failed to create connector: %v", err)
+	}
+
+	span := createSpanWithAttributes("HTTP GET", ptrace.SpanKindServer, map[string]string{
+		"http.route": "/api/users/{id}",
+		"http.target": "/api/users/123",
+	})
+	resourceAttrs := createResourceAttrs(map[string]string{
+		"service.name": "user-service",
+	})
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_ = conn.getSpanName(span, resourceAttrs)
+	}
+}
+
+// BenchmarkGetSpanNameComplex benchmarks complex OTTL expressions
+func BenchmarkGetSpanNameComplex(b *testing.B) {
+	cfg := createDefaultConfig()
+	config := cfg.(*Config)
+	config.Transformations = &Transformations{
+		Rules: []AttributeRule{
+			// Complex condition requiring OTTL evaluation
+			{
+				Condition: "span.kind == SPAN_KIND_SERVER and attributes[\"http.method\"] != nil and IsMatch(attributes[\"http.target\"], \"^/api/.*\")",
+				Template:  "{{.http_method}} {{.http_route}}",
+				Priority:  100,
+			},
+		},
+		FallbackToSpanName: true,
+	}
+
+	conn, err := newConnector(zap.NewNop(), config, clockwork.NewFakeClock())
+	if err != nil {
+		b.Fatalf("Failed to create connector: %v", err)
+	}
+
+	span := createSpanWithAttributes("HTTP GET", ptrace.SpanKindServer, map[string]string{
+		"http.method": "GET",
+		"http.route":  "/api/users/{id}",
+		"http.target": "/api/users/123",
+	})
+	resourceAttrs := createResourceAttrs(map[string]string{
+		"service.name": "user-service",
+	})
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_ = conn.getSpanName(span, resourceAttrs)
+	}
+}
